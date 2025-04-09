@@ -1,0 +1,113 @@
+environment:
+ FORCE_COLOR: "1"
+builder:
+ name: legacy-high-memory
+tools:
+ nodejs: nodejs18
+version: 2.0
+stages:
+ - stage: checkout
+   steps:
+     - default_checkout:
+ - stage: install
+   steps:
+     - yarn:
+         - install --frozen-lockfile
+ - stage: graphql setup
+   steps:
+     - yarn:
+         - grouter codegen
+ - stage: register persisted operations
+   steps:
+     - register_graphql_operations:
+         file_name: persisted-documents.json
+ - stage: 'test'
+   steps:
+     - yarn:
+         - test
+ - stage: 'lint'
+   steps:
+     - yarn:
+         - lint:js
+ - stage: 'version'
+   when: env.BRANCH_NAME == 'main'
+   steps:
+     - tagship:
+         project_type: spa
+         var_name: VERSION
+         tag_initial: true
+     - yarn:
+         - version --no-git-tag-version --new-version $VERSION.0.0
+ - stage: 'build'
+   steps:
+     - yarn:
+         - build
+ - stage: sonar-scan
+   steps:
+     - sonar_scan:
+         project_key: pub-hub-spa
+         git_repo: toasttab/pub-hub-spa
+         project_type: nodejs
+ - stage: snyk
+   steps:
+     - snyk_test:
+ - stage: 'ship'
+   when: env.BRANCH_NAME == 'main'
+   steps:
+     - yarn:
+         - banquet build-import-map-manifest
+          --version=$VERSION
+          --cdnPath=pub-hub-spa
+          --entry=pub-hub-spa:main.js
+     - shell:
+         - mv dist/assets-manifest.json dist/assets-manifest-$VERSION.json
+     - upload_to_s3:
+         source: ./dist
+         target: s3://toast-static-assets/spa/pub-hub-spa/
+         extra_args:
+           - --acl public-read
+     - create_github_release:
+         name: pub-hub-spa-$VERSION
+ - stage: 'adhoc_ship'
+   when: env.BRANCH_NAME != 'main'
+   environment:
+     ADHOC_VERSION: "sh(script: 'echo 0$((2**53 - $TIMESTAMP))', returnStdout: true).trim()"
+   steps:
+     - yarn:
+         - banquet build-import-map-manifest
+          --version=$ADHOC_VERSION
+          --branch=$TADPOLE_BRANCH
+          --cdnPath=pub-hub-spa/adhocs
+          --entry=pub-hub-spa:main.js
+     - parse_field_from_json:
+         file_path: dist/assets-manifest.json
+         field_name: main.js
+         var_name: ADHOC_SHA
+     - echo: $ADHOC_SHA # Optional, for debugging
+     - shell:
+         - mv dist/assets-manifest.json dist/assets-manifest-$ADHOC_VERSION.json
+     - upload_to_s3:
+         source: ./dist
+         target: s3://toast-static-assets/spa/pub-hub-spa/adhocs/
+         extra_args:
+           - --acl public-read
+ - stage: 'adhoc playwright test'
+   when: env.BRANCH_NAME != 'main'
+   steps:
+     - trigger_jenkins_build:
+         job: RCP-Automation-Tests/job/test-runner
+         hostname: jenkins.build.int.toasttab.com
+         parameters:
+           adhocOverrideUrl: "%2f%2fcdn.toasttab.com%2fspa%2fpub-hub-spa%2fadhocs%2f$ADHOC_SHA"
+           branchName: $BRANCH_NAME
+post:
+ always:
+   steps:
+     - slack_send:
+         channel: "#rcp-notifications"
+         message: "Notification from pub-hub-spa build"
+         on_success: false
+         on_failure: env.BRANCH_NAME == 'main'
+         on_recovery: env.BRANCH_NAME == 'main'
+     - testship:
+         - ".build/**"

@@ -1,0 +1,156 @@
+#!/usr/bin/env groovy
+/**
+* This pipeline runs the Smoke Tests on Jenkins. It will run on a cron.
+*/
+pipeline {
+ agent {
+   label 'playwright'
+ }
+
+
+ parameters {
+   string(
+       defaultValue: "--project chromium --workers=1 --retries=1",
+       description: 'Playwright test CLI arg. Default is --project chromium --workers=1 --retries=1. You can pass custom arguments, e.g., --grep @smoke',
+       name: 'playwrightCLITestArg'
+   )
+   string(name: 'adhocOverrideUrl', defaultValue: '', description: 'Override the URL for the Playwright tests')
+   string(name: 'branchName', defaultValue: 'main', description: 'Git branch to use')
+    string(defaultValue: "#rcp-notifications", description: 'Slack #channel or @name', name: 'slackSendTo')
+   string(defaultValue: "false", description: 'true sends results to testrail. Default is false', name: 'useTestrailIntegration')
+ }
+
+
+ environment {
+   // To modify configuration while running on CI
+   CI = 'true'
+   TEST_USER_1_EMAIL = credentials ('rcp-toastweb-playwright-email')
+   TEST_USER_1_PASSWORD = credentials ('rcp-toastweb-playwright-pw')
+   API_CLIENT_ID  = credentials ('rcp-playwright-api-client-id')
+   API_CLIENT_SECRET= credentials ('rcp-playwright-api-client-secret')
+ }
+
+
+ options {
+   timestamps()
+   //only log 14 days worth of jenkins runs
+   buildDiscarder(logRotator(numToKeepStr: '14'))
+ }
+
+
+   // Add the trigger for periodic builds
+ triggers {
+   cron('H 2 * * 1-5')  // Cron job to run every day at midnight
+ }
+
+
+ stages {
+   stage('Install Playwright') {
+     steps {
+       script {
+         sh 'node --max-old-space-size=4096 $(which npm) install --legacy-peer-deps'
+         sh 'npx playwright install chromium'
+       }
+     }
+   }
+
+
+  stage('Run Playwright Tests') {
+   steps {
+       script {
+           // Conditionally set default values based on the triggering method (manual or cron)
+           def playwrightArgs = params.playwrightCLITestArg ?: "--project chromium --workers=1 --retries=1"
+           def branch = params.branchName ?: "main"
+           def overrideUrl = params.adhocOverrideUrl ?: ""
+
+
+           // If this is a cron-triggered run, you may want to use specific defaults
+           if (env.BRANCH_NAME == "main" && !params.branchName) {
+               // Set a different branch or URL if triggered by cron for example
+               branch = "main"
+               overrideUrl = "https://default-url.com"
+           }
+
+
+
+
+           // Echo for debugging
+           echo "Running Playwright tests with arguments: ${playwrightArgs}, Branch: ${branch}, Override URL: ${overrideUrl}"
+
+
+           // Ensure the test-results directory exists before running tests
+           sh 'mkdir -p test-results'
+
+
+           // Run the Playwright tests with the final arguments
+           sh "USE_TESTRAIL_INTEGRATION=${params.useTestrailIntegration} npx playwright test ${playwrightArgs}"
+
+
+           // Check if the test-results directory exists
+           echo "Checking contents of test-results directory"
+           sh 'ls -l test-results'  // This will display the contents of the test-results directory
+
+
+           // Optional: output the contents of the JUnit report file to the console for debugging
+           echo "Contents of the JUnit report"
+           sh 'cat test-results/test-results.xml' // This will print the contents of the JUnit report if it exists
+       }
+   }
+
+
+     post {
+       always {
+         script {
+           sendSlackTestResults()
+           try {
+             stage('Publish HTML Report') {
+               publishHTML([allowMissing: false, alwaysLinkToLastBuild: true, keepAll: true, reportDir: 'playwright-report', reportFiles: 'index.html', reportName: 'Playwright HTML Report', reportTitles: '', useWrapperFileDirectly: true])
+             }
+           } catch (Exception e) {
+             echo "Error in Publish HTML Report stage: ${e.message}"
+           }
+           try {
+             stage('JUnit Results') {
+               junit 'test-results/test-results.xml'
+             }
+           } catch (Exception e) {
+             echo "Error in JUnit Results stage: ${e.message}"
+           }
+           try {
+             stage('Archive Reports') {
+               archiveArtifacts artifacts: '**/test-results/**', allowEmptyArchive: true
+             }
+           } catch (Exception e) {
+             echo "Error in Archive Playwright Reports stage: ${e.message}"
+           }
+         }
+       }
+     }
+   }
+ }
+}
+
+
+def lines(recoveredStr = '') {
+ ["pub-hub-spa Publish History Playwright Tests${recoveredStr}",
+  "*${currentBuild.currentResult}*!",
+  "${env.BRANCH_NAME ?: 'main'}",
+  "View Full Report (check this first):",
+  "${env.BUILD_URL}Playwright_20HTML_20Report/",
+  "View Jenkins Build:",
+  "${env.BUILD_URL}"
+ ]
+}
+
+
+def sendSlackTestResults() {
+   def COLOR_MAP = [
+       'SUCCESS': 'good',
+       'FAILURE': 'danger',
+   ]
+
+
+   slackSend channel: "${params.slackSendTo}", color: COLOR_MAP[currentBuild.currentResult], failOnError: false,
+     tokenCredentialId: 'external/tadpole/slack',
+     message: lines().join('\n')
+}
